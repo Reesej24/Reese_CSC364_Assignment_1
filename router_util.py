@@ -8,7 +8,7 @@ import traceback
 from threading import Thread
 
 host = "127.0.0.1"
-packets_table = "packets.csv"
+packets_table = "input/packets.csv"
 
 # The purpose of this function is to perform a bitwise NOT on an unsigned integer.
 def bit_not(n, numbits=32):
@@ -55,12 +55,12 @@ def find_default_gateway(table):
     # 1. Traverse the table, row by row,
     for row in table:
         # 2. and if the network destination of that row matches 0.0.0.0,
-        try:
-            if row[0] == "0.0.0.0":
-                # 3. then return the interface of that row.
-                return int(row[3])
-        except ValueError:
-            continue
+        
+        if row[0] == "0.0.0.0":
+            # 3. then return the interface of that row.
+            if row[3].isdigit():
+                return row[3]
+            
 # The purpose of this function is to find the range of IPs inside a given destination IP address/subnet mask pair.
 def find_ip_range(network_dst, netmask):
     # 1. Perform a bitwise AND on the network destination and netmask
@@ -82,7 +82,7 @@ def find_ip_range(network_dst, netmask):
 # The purpose of this function is to convert a string IP to its binary representation.
 def ip_to_bin(ip):
     # 1. Split the IP into octets.
-    ip_octets = ip.split(".")
+    ip_octets = ip.strip().split(".")
     # 2. Create an empty string to store each binary octet.
     ip_bin_string = ""
     # 3. Traverse the IP, octet by octet
@@ -110,22 +110,28 @@ def generate_forwarding_table_with_range(table):
     for row in table:
         # 3. and process each network destination other than 0.0.0.0
         if row[0] != "0.0.0.0":
-            # 4. Store the network destination and netmask.
-            network_dst_string = row[0]
-            netmask_string = row[1]
-            
-            # 5. Convert both string into their binary representations.
-            network_dst_bin = ip_to_bin(network_dst_string)
-            netmask_bin = ip_to_bin(netmask_string)
-            
-            # 6. Find the IP range.
-            ip_range = find_ip_range(network_dst_bin, netmask_bin)
-            
-            # 7. Build the new row
-            new_row = row + [ip_range]
-            
-            # 8. Append the new row to new_table.
-            new_table.append(new_row)
+            try:
+                # 4. Store the network destination and netmask.
+                network_dst_string = row[0]
+                netmask_string = row[1]
+                
+                # 5. Convert both string into their binary representations.
+                network_dst_bin = ip_to_bin(network_dst_string)
+                netmask_bin = ip_to_bin(netmask_string)
+                
+                # 6. Find the IP range.
+                ip_range = find_ip_range(network_dst_bin, netmask_bin)
+                
+                # Get interface
+                interface = row[3]
+                
+                # Build new row
+                new_row = [ip_range, interface]
+                
+                # 8. Append the new row to new_table.
+                new_table.append(new_row)
+            except ValueError:
+                continue
     # 9. Return the new table
     return new_table
 
@@ -137,14 +143,18 @@ def receive_packet(router_id, connection, max_buffer_size):
         print(f"The packet size is greater than expected. {packet_size}")
         
     decoded_packet = data.decode("utf-8").strip()
+    if not decoded_packet or decoded_packet.count(",") != 3:
+        print(f"Skipping invalid packet: '{decoded_packet}'")
+        return []
     print(f"Received packet, {decoded_packet}")
-    write_to_file(f"received_by_router_{router_id}.txt", decoded_packet)
+    write_to_file(f"output/received_by_router_{router_id}.txt", decoded_packet)
     packet = decoded_packet.split(",")
-    return packet
+    return packet if len(packet) == 4 else []
 
 # The purpose of this function is to write packets/payload to file.
 def write_to_file(path, packet_to_write, send_to_router=None):
     # 1. Open the output file for appending.
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     out_file = open(path, "a")
     # 2. If this router is not sending, then just append the packet to the output file.
     if send_to_router is None:
@@ -156,40 +166,58 @@ def write_to_file(path, packet_to_write, send_to_router=None):
     out_file.close()
                  
 # The purpose of this function is to find the next destination for the packet                 
-def find_next_hop(packet, socket_to_dest_router_1, socket_to_dest_router_2, forwarding_table_with_range, default_gateway_port, router_id, dest_router_1, dest_router_2):
-            source_ip = packet[0]
-            destination_ip = packet[1]
-            payload = packet[2]
-            ttl = int(packet[3])
-            
-            new_ttl = ttl - 1
-            new_packet = f"{source_ip},{destination_ip},{payload},{new_ttl}"
-            destination_ip_bin = ip_to_bin(destination_ip)
-            
-            sending_port = None
-            for row in forwarding_table_with_range:
-                ip_range = row[4]
-                if ip_range[0] <= destination_ip_bin <= ip_range[1]:
-                    sending_port = int(row[3])
+def find_next_hop(packet, socket_to_dest_router_1, socket_to_dest_router_2, forwarding_table_with_range, default_gateway_port, router_id, dest_router_1, dest_port_1, dest_router_2, dest_port_2):
+    
+    if not packet or len(packet) < 4:
+        print(f"invalid packet structure: {packet}")
+        return
+    
+    source_ip = packet[0]
+    destination_ip = packet[1]
+    payload = packet[2]
+    ttl = int(packet[3])
+    
+    new_ttl = ttl - 1
+    new_packet = f"{source_ip},{destination_ip},{payload},{new_ttl}"
+    destination_ip_bin = ip_to_bin(destination_ip)
+    
+    chosen_interface = None
+    is_final_hop = False
+    
+    for row in forwarding_table_with_range:
+        ip_range, interface = row
+        try:
+            if ip_range[0] <= destination_ip_bin <= ip_range[1]:
+                if interface == host:
+                    print(f"OUT: {payload}")
+                    write_to_file(f"output/out_router_{router_id}.txt", payload)
+                    return
+                else:
+                    chosen_interface = int(interface)
                     break
-                
-            if sending_port is None:
-                sending_port = default_gateway_port
-                
-            if new_ttl <= 0:
-                print(f"DISCARD: {new_packet}")
-                write_to_file(f"discarded_by_router_{router_id}.txt")
-            elif socket_to_dest_router_1 is not None:
-                print(f"Sending packet {new_packet} to Router {dest_router_1}")
-                socket_to_dest_router_1.sendall(new_packet.encode("utf-8"))
-                write_to_file(f"sent_by_router_{router_id}.txt", new_packet, str(dest_router_1))
-            elif socket_to_dest_router_2 is not None:
-                print(f"Sending packet {new_packet} to Router {dest_router_1}")
-                socket_to_dest_router_2.sendall(new_packet.encode("utf-8"))
-                write_to_file(f"sent_by_router_{router_id}.txt", new_packet, str(dest_router_2))
-            else:
-                print(f"OUT: {payload}")
-                write_to_file(f"out_router_{router_id}.txt", payload)
+        except ValueError:
+            continue
+        
+    if not is_final_hop and not chosen_interface:
+        chosen_interface = default_gateway_port
+        
+    if new_ttl <= 0:
+        print(f"DISCARD: {new_packet}")
+        write_to_file(f"output/discarded_by_router_{router_id}.txt", new_packet)
+    elif is_final_hop:
+        print(f"OUT: {payload}")
+        write_to_file(f"output/out_router_{router_id}.txt", payload)
+    elif chosen_interface == dest_port_1 and socket_to_dest_router_1:
+        print(f"Sending packet {new_packet} to Router {dest_router_1}")
+        socket_to_dest_router_1.sendall(new_packet.encode("utf-8"))
+        write_to_file(f"output/sent_by_router_{router_id}.txt", new_packet, str(dest_router_1))
+    elif chosen_interface == dest_port_2 and socket_to_dest_router_2:
+        print(f"Sending packet {new_packet} to Router {dest_router_1}")
+        socket_to_dest_router_2.sendall(new_packet.encode("utf-8"))
+        write_to_file(f"output/sent_by_router_{router_id}.txt", new_packet, str(dest_router_2))
+    else:
+        print(f"OUT: {payload}")
+        write_to_file(f"output/out_router_{router_id}.txt", payload)
                                 
 # The purpose of this function is to receive and process incoming packets.
 def processing_thread(router_id, connection=None, forwarding_table_with_range=None, default_gateway_port=None, dest_router_1=None, dest_port_1=0, dest_router_2=None, dest_port_2=0, max_buffer_size=5120):
@@ -210,7 +238,7 @@ def processing_thread(router_id, connection=None, forwarding_table_with_range=No
                 break
             
             # Find the next destination for the packet
-            find_next_hop(packet, socket1, socket2, forwarding_table_with_range, default_gateway_port, router_id, dest_router_1, dest_router_2)
+            find_next_hop(packet, socket1, socket2, forwarding_table_with_range, default_gateway_port, router_id, dest_router_1, dest_port_1,  dest_router_2, dest_port_2)
     # This is router 1 where the packages are read and sent from
     else:
         
